@@ -75,7 +75,7 @@ class BaseFilter(abc.ABC):
         pass
 
 
-    @tf.function(jit_compile=True)
+    @tf.function(jit_compile=True, reduce_retracing=True)
     def _compiled_loop(self, observations: tf.Tensor, initial_state: Any) -> tf.Tensor:
         """
         The core iterative loop. Internal.
