@@ -1,6 +1,8 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
 from typing import Tuple
+import numpy as np
+from typing import Any, Tuple, Dict, Optional
 
 from ..filter_base import BaseFilter
 from StateSpaceModels.linear_gaussian import LinearGaussianSSM
@@ -112,6 +114,12 @@ class KalmanFilter(BaseFilter):
         S = tf.matmul(self.C, tf.matmul(P_pred, self.C, transpose_b=True)) + self.R            # Innovation Covariance     
         cond_S = self.get_condition_number(S)
 
+        obs_dist = tfp.distributions.MultivariateNormalFullCovariance(
+            loc=tf.zeros_like(y_pred), 
+            covariance_matrix=S + tf.eye(self.ny, dtype=self.dtype) * 1e-6
+        )
+        step_log_likelihood = obs_dist.log_prob(y_res)                                        # For PMMH likelihood tracking
+
         CP_T = tf.matmul(self.C, P_pred, transpose_b=True)                                     # Kalman Gain                     
         K_transpose = tf.linalg.solve(S, CP_T) 
         K = tf.transpose(K_transpose)
@@ -129,4 +137,28 @@ class KalmanFilter(BaseFilter):
             P_new = tf.matmul(I_KC, P_pred)
 
         cond_P = self.get_condition_number(P_new)
-        return (x_new, P_new), x_new, tf.stack([cond_S, cond_P])
+        # return (x_new, P_new), x_new, tf.stack([cond_S, cond_P])
+        return (x_new, P_new), x_new, tf.stack([cond_S, cond_P, step_log_likelihood])
+    
+
+    def run_filter(self, observations: tf.Tensor, true_states: Optional[tf.Tensor] = None) -> Dict[str, Any]:
+        """
+        Runs the filter and extracts the exact marginal log-likelihood 
+        from the tracked step metrics.
+        """
+        # Call the underlying BaseFilter compiled loop and metrics gathering
+        results = super().run_filter(observations, true_states)
+        
+        if 'step_metrics' in results:
+            # step_metrics format: [cond_S, cond_P, step_log_likelihood]
+            step_metrics_np = results['step_metrics']
+            
+            # The exact marginal log-likelihood is the sum over all timesteps
+            results['log_likelihood'] = float(np.sum(step_metrics_np[:, 2]))
+            
+            # Optional: You can also cleanly export your condition numbers here
+            results['avg_cond_S'] = float(np.mean(step_metrics_np[:, 0]))
+            results['avg_cond_P'] = float(np.mean(step_metrics_np[:, 1]))
+            
+        self.metrics = results
+        return results

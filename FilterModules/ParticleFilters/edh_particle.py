@@ -111,6 +111,9 @@ class PFPF_EDHFilter(ParticleFilter, ExactDaumHuangFilter):
         diff = obs_t - pred_obs_mean
         log_lik = self.obs_noise_dist.log_prob(diff)
         log_weights += log_lik + log_det_J
+
+        max_log_w = tf.reduce_max(log_weights)
+        step_log_likelihood = max_log_w + tf.math.log(tf.reduce_mean(tf.exp(log_weights - max_log_w)))   # For PMMH
         
         log_w_norm = log_weights - tf.reduce_logsumexp(log_weights)         # ESS and Conditonal Resampling
         w_norm = tf.exp(log_w_norm)
@@ -130,7 +133,8 @@ class PFPF_EDHFilter(ParticleFilter, ExactDaumHuangFilter):
         m_upd, P_upd = ekf_updated_state
         
         avg_cond = total_cond / tf.cast(self.steps, self.dtype)
-        metrics = tf.concat([[ess], [avg_cond], ekf_metrics], axis=0)
+        # metrics = tf.concat([[ess], [avg_cond], ekf_metrics], axis=0)
+        metrics = tf.concat([[ess], [avg_cond], ekf_metrics, [step_log_likelihood]], axis=0)
         return (particles, log_weights, m_upd, P_upd), x_est, metrics
 
 
@@ -252,6 +256,8 @@ class PFPF_EDHFilter(ParticleFilter, ExactDaumHuangFilter):
             'steps': self.steps,
             'threshold_ratio': self.ratio
         }
+
+        results['log_likelihood'] = float(np.sum(step_metrics_tensor.numpy()[:, -1]))
         
         self.metrics = results
         return results

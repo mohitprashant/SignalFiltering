@@ -1,10 +1,12 @@
 import tensorflow as tf
 from typing import Any, Tuple, Dict, Optional
+import tensorflow_probability as tfp
 
 from .kalman import KalmanFilter
 from StateSpaceModels.ssm_base import SSM
 
 DTYPE = tf.float32
+tfd = tfp.distributions
 
 
 class UnscentedKalmanFilter(KalmanFilter):
@@ -100,6 +102,12 @@ class UnscentedKalmanFilter(KalmanFilter):
         S = tf.matmul(diff_y, diff_y_scaled, transpose_a=True) + self.R
         S = (S + tf.transpose(S)) / 2.0                                         # Enforce symmetry to prevent MatrixSolve failure
         cond_S = self.get_condition_number(S)
+
+        obs_dist = tfp.distributions.MultivariateNormalFullCovariance(
+            loc=tf.zeros_like(y_res), 
+            covariance_matrix=S + tf.eye(self.ny, dtype=self.dtype) * 1e-6
+        )
+        step_log_likelihood = obs_dist.log_prob(y_res)                              # For PMMH likelihood tracking
         
         diff_x = sigmas_update - x_pred                                         
         Pxy = tf.matmul(diff_x, diff_y_scaled, transpose_a=True)
@@ -112,10 +120,25 @@ class UnscentedKalmanFilter(KalmanFilter):
         P_new = (P_new + tf.transpose(P_new)) / 2.0                             # Enforce symmetry to maintain PSD invariant
         cond_P = self.get_condition_number(P_new)
         
-        metrics = tf.stack([cond_S, cond_P])
+        # metrics = tf.stack([cond_S, cond_P])
+        metrics = tf.stack([cond_S, cond_P, step_log_likelihood])
         return (x_new, P_new), x_new, metrics
 
 
+    # def run_filter(self, observations: tf.Tensor, true_states: Optional[tf.Tensor] = None) -> Dict[str, Any]:
+    #     processed_obs = self.preprocess_obs(observations)
+    #     return super().run_filter(processed_obs, true_states)
+    
     def run_filter(self, observations: tf.Tensor, true_states: Optional[tf.Tensor] = None) -> Dict[str, Any]:
+        """
+        Executes the UKF over a sequence of observations.
+        Pre-processes the observations and leverages the base KalmanFilter 
+        to track the marginal log-likelihood.
+        """
         processed_obs = self.preprocess_obs(observations)
-        return super().run_filter(processed_obs, true_states)
+        
+        # This calls the KalmanFilter.run_filter, automatically giving you the log_likelihood
+        results = super().run_filter(processed_obs, true_states)
+        
+        self.metrics = results
+        return results

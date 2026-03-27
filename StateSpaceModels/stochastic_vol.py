@@ -22,7 +22,7 @@ class StochasticVolatilityModel(SSM):
         sigma (tf.Tensor): State noise standard deviation.
         beta (tf.Tensor): Observation scaling factor.
     """
-    def __init__(self, alpha, sigma, beta):
+    def __init__(self, alpha, sigma, beta, static_diff=False):
         """
         Initialize the model parameters.
 
@@ -31,9 +31,14 @@ class StochasticVolatilityModel(SSM):
             sigma (float): State noise std dev (e.g., 1.0).
             beta (float): Observation scale (e.g., 0.5).
         """
-        self.alpha = tf.convert_to_tensor(alpha, dtype=DTYPE)
-        self.sigma = tf.convert_to_tensor(sigma, dtype=DTYPE)
-        self.beta = tf.convert_to_tensor(beta, dtype=DTYPE)
+        if(static_diff):
+            self.alpha = tf.convert_to_tensor(alpha, dtype=DTYPE)
+            self.sigma = tf.convert_to_tensor(sigma, dtype=DTYPE)
+            self.beta = tf.convert_to_tensor(beta, dtype=DTYPE)
+        else:
+            self.alpha = tf.Variable(alpha, dtype=DTYPE)
+            self.sigma = tf.Variable(sigma, dtype=DTYPE)
+            self.beta = tf.Variable(beta, dtype=DTYPE)
 
 
     def initial_dist(self):
@@ -89,3 +94,29 @@ class StochasticVolatilityModel(SSM):
         }
     
 
+    def dynamic_filter_components(self):
+        """
+        Returns components as functions of dynamic tensor tuple `theta` for XLA.
+        Expected theta structure: (alpha, sigma, beta)
+        """
+        return {
+            "nx": 1,
+            "ny": 1,
+            
+            # f(x) = alpha * x
+            "f_func": lambda x, theta: theta[0] * x,
+            
+            # h(x) = x + log(beta^2) - 1.2704
+            "h_func": lambda x, theta: x + tf.math.log(theta[2]**2) - 1.2704,
+            
+            # Q = sigma^2
+            "Q_func": lambda theta: tf.reshape(theta[1]**2, [1, 1]),
+            
+            # R is derived from the log-chi-square approximation, stays constant
+            "R_func": lambda theta: tf.reshape(tf.constant((np.pi**2) / 2.0, dtype=DTYPE), [1, 1]),
+            
+            # P_init = sigma^2 / (1 - alpha^2)
+            "P_init_func": lambda theta: tf.reshape((theta[1]**2) / (1.0 - theta[0]**2 + 1e-4), [1, 1]),
+            
+            "preprocess_obs": lambda y: tf.reshape(tf.math.log(y**2 + 1e-8), [-1, 1])
+        }

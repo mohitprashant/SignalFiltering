@@ -131,3 +131,21 @@ class BaseFilter(abc.ABC):
             'step_metrics': step_metrics_tensor
         }
         return self.metrics
+    
+
+    # @tf.function(reduce_retracing=True)
+    def _compiled_marginal_log_likelihood(self, observations: tf.Tensor, initial_state: Any) -> tf.Tensor:
+        """
+        A dedicated loop for parameter estimation (HMC).
+        Accumulates only the marginal log-likelihood to avoid TensorArray in the XLA backward pass.
+        """
+        T = tf.shape(observations)[0]
+        state = initial_state
+        total_ll = tf.constant(0.0, dtype=DTYPE)
+
+        for t in tf.range(T):
+            state_pred = self.predict(state)
+            state, _, step_metrics = self.update(state_pred, observations[t])
+            total_ll += step_metrics[1] 
+
+        return total_ll

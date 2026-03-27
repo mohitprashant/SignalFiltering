@@ -15,7 +15,7 @@ class MultivariateStochasticVolatilityModel(SSM):
         x_{t+1} = diag(phi) * x_t + eta_t
         y_t     = beta * exp(x_t / 2) * eps_t
     """
-    def __init__(self, p, phi, sigma_eta, sigma_eps, beta):
+    def __init__(self, p, phi, sigma_eta, sigma_eps, beta, static_diff=False):
         """
         Initializes the Multivariate SV parameters.
 
@@ -28,15 +28,45 @@ class MultivariateStochasticVolatilityModel(SSM):
             sigma_eps (tf.Tensor): Covariance matrix for observation noise (epsilon). Shape (p, p).
         """
         self.p = int(p)
-        self.phi = tf.convert_to_tensor(phi, dtype=DTYPE)
-        self.beta = tf.convert_to_tensor(beta, dtype=DTYPE)
-        self.sigma_eta = tf.convert_to_tensor(sigma_eta, dtype=DTYPE)
-        self.sigma_eps = tf.convert_to_tensor(sigma_eps, dtype=DTYPE)
-        
-        self.chol_eps = tf.linalg.cholesky(self.sigma_eps)
-        self.chol_eta = tf.linalg.cholesky(self.sigma_eta)
-        self.precision_eta = tf.linalg.inv(self.sigma_eta + 1e-5 * tf.eye(self.p))
         self.dtype = DTYPE
+
+        if(static_diff):
+            self.phi = tf.convert_to_tensor(phi, dtype=DTYPE)
+            self.beta = tf.convert_to_tensor(beta, dtype=DTYPE)
+            self.sigma_eta = tf.convert_to_tensor(sigma_eta, dtype=DTYPE)
+            self.sigma_eps = tf.convert_to_tensor(sigma_eps, dtype=DTYPE)
+        else:
+            self.phi = tf.Variable(phi, dtype=DTYPE)
+            self.beta = tf.Variable(beta, dtype=DTYPE)
+            self.sigma_eta = tf.Variable(sigma_eta, dtype=DTYPE)
+            self.sigma_eps = tf.Variable(sigma_eps, dtype=DTYPE)
+        
+        # self.chol_eps = tf.linalg.cholesky(self.sigma_eps)
+        # self.chol_eta = tf.linalg.cholesky(self.sigma_eta)
+        # self.precision_eta = tf.linalg.inv(self.sigma_eta + 1e-5 * tf.eye(self.p))
+        # self.dtype = DTYPE
+
+        
+        
+        
+        
+        # Must recompute the below if the above is changed
+        # self.chol_eps = tf.linalg.cholesky(self.sigma_eps)
+        # self.chol_eta = tf.linalg.cholesky(self.sigma_eta)
+        # self.precision_eta = tf.linalg.inv(self.sigma_eta + 1e-5 * tf.eye(self.p))
+
+    @property
+    def chol_eps(self):
+        return tf.linalg.cholesky(self.sigma_eps)
+
+    @property
+    def chol_eta(self):
+        return tf.linalg.cholesky(self.sigma_eta)
+
+    @property
+    def precision_eta(self):
+        return tf.linalg.inv(self.sigma_eta + 1e-5 * tf.eye(self.p, dtype=self.dtype))
+    
 
 
     def initial_dist(self):
@@ -104,3 +134,41 @@ class MultivariateStochasticVolatilityModel(SSM):
             "preprocess_obs": lambda y: tf.reshape(tf.math.log(y**2 + 1e-8), [-1, self.p])
         }
     
+
+    def dynamic_filter_components(self):
+        """
+        Returns components as functions of dynamic tensor tuple `theta` for XLA.
+        Expected theta structure: (phi, sigma_eta, sigma_eps, beta)
+        """
+        def make_phi_matrix(phi_tensor):
+            # Convert 1D phi to diagonal matrix if needed
+            if len(phi_tensor.shape) == 1:
+                return tf.linalg.diag(phi_tensor)
+            return phi_tensor
+
+        def calc_p_init(theta):
+            phi, sigma_eta, _, _ = theta
+            var = tf.linalg.diag_part(sigma_eta) / (1.0 - phi**2 + 1e-4)
+            return tf.linalg.diag(var)
+
+        return {
+            "nx": self.p,
+            "ny": self.p,
+            
+            # f(x) = diag(phi) * x
+            "f_func": lambda x, theta: tf.linalg.matvec(make_phi_matrix(theta[0]), x),
+            
+            # h(x) = x + log(beta^2) - 1.2704
+            "h_func": lambda x, theta: x + tf.math.log(theta[3]**2) - 1.2704,
+            
+            # Q = sigma_eta
+            "Q_func": lambda theta: theta[1],
+            
+            # R is derived from the log-chi-square approximation, stays constant
+            "R_func": lambda theta: tf.eye(self.p, dtype=self.dtype) * ((np.pi**2) / 2.0),
+            
+            # P_init is calculated dynamically from phi and sigma_eta
+            "P_init_func": calc_p_init,
+            
+            "preprocess_obs": lambda y: tf.reshape(tf.math.log(y**2 + 1e-8), [-1, self.p])
+        }

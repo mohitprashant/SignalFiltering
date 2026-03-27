@@ -19,7 +19,7 @@ class Lorenz96Model(SSM):
     Observation: 
         Y_k = X_k + v_k  where v_k ~ N(0, R)
     """
-    def __init__(self, K=40, F=8.0, dt=0.05, process_std=0.1, obs_std=1.0):
+    def __init__(self, K=40, F=8.0, dt=0.05, process_std=0.1, obs_std=1.0, static_diff=False):
         """
         Initializes the Lorenz 96 model parameters.
 
@@ -30,16 +30,49 @@ class Lorenz96Model(SSM):
             process_std (float): Standard deviation of the additive process noise.
             obs_std (float): Standard deviation of the additive observation noise.
         """
-        self.K = K
-        self.F = tf.constant(F, dtype=DTYPE)
-        self.dt = tf.constant(dt, dtype=DTYPE)
-        self.dtype = DTYPE
         
-        # Noise Covariances
-        self.Q_diag = tf.fill([K], tf.constant(process_std, dtype=DTYPE)**2)
-        self.R_diag = tf.fill([K], tf.constant(obs_std, dtype=DTYPE)**2)
-        self.R = tf.linalg.diag(self.R_diag)
-        self.Q = tf.linalg.diag(self.Q_diag)
+        
+        # # Noise Covariances
+        # self.Q_diag = tf.fill([K], tf.constant(process_std, dtype=DTYPE)**2)
+        # self.R_diag = tf.fill([K], tf.constant(obs_std, dtype=DTYPE)**2)
+        # self.R = tf.linalg.diag(self.R_diag)
+        # self.Q = tf.linalg.diag(self.Q_diag)
+
+        self.K = K
+        self.dtype = DTYPE
+
+        if(static_diff):
+            self.F = tf.constant(F, dtype=DTYPE)
+            self.dt = tf.constant(dt, dtype=DTYPE)
+            self.process_std = tf.constant(process_std, dtype=DTYPE)
+            self.obs_std = tf.constant(obs_std, dtype=DTYPE)
+        else:
+            self.F = tf.Variable(F, dtype=DTYPE)
+            self.dt = tf.Variable(dt, dtype=DTYPE)
+            self.process_std = tf.Variable(process_std, dtype=DTYPE)
+            self.obs_std = tf.Variable(obs_std, dtype=DTYPE)
+
+        # self.Q_diag = tf.fill([K], self.process_std**2)
+        # self.R_diag = tf.fill([K], self.obs_std**2)
+        # self.R = tf.linalg.diag(self.R_diag)
+        # self.Q = tf.linalg.diag(self.Q_diag)
+
+    @property
+    def Q_diag(self):
+        return tf.fill([self.K], self.process_std**2)
+
+    @property
+    def R_diag(self):
+        return tf.fill([self.K], self.obs_std**2)
+
+    @property
+    def R(self):
+        return tf.linalg.diag(self.R_diag)
+
+    @property
+    def Q(self):
+        return tf.linalg.diag(self.Q_diag)
+
 
 
     def rk4_step(self, x):
@@ -192,3 +225,44 @@ class Lorenz96Model(SSM):
             "preprocess_obs": lambda y: tf.reshape(y, [-1, self.K])
         }
     
+
+    def dynamic_filter_components(self):
+        """
+        Returns components as functions of dynamic tensor tuple `theta` for XLA.
+        Expected theta structure: (F, process_std, obs_std)
+        """
+        def rk4_dynamic(x, F):
+            """Dynamic RK4 step that accepts varying F values"""
+            def ode(state):
+                x_p1 = tf.roll(state, shift=-1, axis=-1)
+                x_m1 = tf.roll(state, shift=1, axis=-1)
+                x_m2 = tf.roll(state, shift=2, axis=-1)
+                return (x_p1 - x_m2) * x_m1 - state + F
+
+            k1 = ode(x)
+            k2 = ode(x + 0.5 * self.dt * k1)
+            k3 = ode(x + 0.5 * self.dt * k2)
+            k4 = ode(x + self.dt * k3)
+            return x + (self.dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+
+        return {
+            "nx": self.K,
+            "ny": self.K,
+            
+            # f(x) dynamically computes the RK4 step using the current F
+            "f_func": lambda x, theta: rk4_dynamic(x, theta[0]),
+            
+            # h(x) = x
+            "h_func": lambda x, theta: x,
+            
+            # Q = diag(process_std^2)
+            "Q_func": lambda theta: tf.linalg.diag(tf.fill([self.K], theta[1]**2)),
+            
+            # R = diag(obs_std^2)
+            "R_func": lambda theta: tf.linalg.diag(tf.fill([self.K], theta[2]**2)),
+            
+            # P_init remains a small constant diagonal matrix 
+            "P_init_func": lambda theta: tf.eye(self.K, dtype=self.dtype) * (0.1**2),
+            
+            "preprocess_obs": lambda y: tf.reshape(y, [-1, self.K])
+        }

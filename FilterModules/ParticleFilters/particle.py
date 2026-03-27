@@ -144,21 +144,27 @@ class ParticleFilter(BaseFilter):
         diff = obs_t - pred_obs_mean
         
         log_weights += self.obs_noise_dist.log_prob(diff)
+        max_log_w = tf.reduce_max(log_weights)
+        step_log_likelihood = max_log_w + tf.math.log(tf.reduce_mean(tf.exp(log_weights - max_log_w)))  # For PMMH
+
         log_w_norm = log_weights - tf.reduce_logsumexp(log_weights)                    # ESS Calculation
         w_norm = tf.exp(log_w_norm)
         ess = 1.0 / (tf.reduce_sum(w_norm**2) + 1e-12)
         
-        particles, log_weights = tf.cond(                                              # Adaptive Resampling, using tf.cond for XLA graph
-            ess < self.ess_threshold, 
-            lambda: self.resample(particles, log_weights), 
-            lambda: (particles, log_weights)
-        )
+        # particles, log_weights = tf.cond(                                              # Adaptive Resampling, using tf.cond for XLA graph
+        #     ess < self.ess_threshold, 
+        #     lambda: self.resample(particles, log_weights), 
+        #     lambda: (particles, log_weights)
+        # )
+
+        particles, log_weights = self.resample(particles, log_weights)
         
         log_w_norm_final = log_weights - tf.reduce_logsumexp(log_weights)              # Output Extraction
         w_norm_final = tf.exp(log_w_norm_final)
         x_est = tf.reduce_sum(w_norm_final[:, tf.newaxis] * particles, axis=0)
         
-        metrics = tf.stack([ess])                                                       # Add ESS to metrics
+        # metrics = tf.stack([ess])                                                       # Add ESS to metrics
+        metrics = tf.stack([ess, step_log_likelihood])
         return (particles, log_weights), x_est, metrics
 
 
@@ -189,6 +195,7 @@ class ParticleFilter(BaseFilter):
         
         if('step_metrics' in results):
             results['ess_avg'] = np.mean(results['step_metrics'][:, 0])
+            results['log_likelihood'] = np.sum(results['step_metrics'][:, 1])
             
         results['particles'] = self.num_particles
         results['threshold_ratio'] = self.ratio
