@@ -155,7 +155,7 @@ if __name__ == "__main__":
         init_theta=init_theta_sv,
         param_labels=param_labels_sv,
         T=200,
-        num_iterations=500,
+        num_iterations=300,
         burn_in=50,
         step_size=0.01,
         num_leapfrog_steps=10
