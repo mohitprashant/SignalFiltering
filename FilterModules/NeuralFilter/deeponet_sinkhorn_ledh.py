@@ -267,7 +267,7 @@ class DeepONetSinkhornLEDHFilter(DiffSinkhornLEDHFilter):
     # Update: cache observation, then run LEDH + neural Sinkhorn
     # ------------------------------------------------------------------
 
-    @tf.function(jit_compile=True)
+    @tf.function
     def update(
         self,
         state_pred:  Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor],
@@ -468,6 +468,7 @@ class DeepONetSinkhornLEDHFilter(DiffSinkhornLEDHFilter):
     # Override marginal log-likelihood accumulator for HMC compatibility
     # ------------------------------------------------------------------
 
+    @tf.function
     def _compiled_marginal_log_likelihood(
         self,
         observations:  tf.Tensor,
@@ -482,8 +483,9 @@ class DeepONetSinkhornLEDHFilter(DiffSinkhornLEDHFilter):
         override reads the last element (step_log_likelihood), which is
         correct for both this filter and the parent.
 
-        Gradient tapes used by HMC will differentiate through this loop
-        with respect to the SSM parameters embedded in f_func / h_func.
+        @tf.function (without jit_compile) converts the Python for-loop to a
+        tf.while_loop, dispatching the entire T-step pass as a single GPU graph
+        rather than T separate eager calls. Gradients flow through while_loop_grad.
         """
         T        = tf.shape(observations)[0]
         state    = initial_state
