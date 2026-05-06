@@ -3,14 +3,24 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 import matplotlib.pyplot as plt
-from typing import Callable, Any, Dict, List, Tuple
+from typing import Callable, Any, Dict, List
 
 
-from ParamEstimationPipeline.hmc_pipeline import HMC
+from ParamEstimationPipeline.hmc_pipeline  import HMC
+from ParamEstimationPipeline.deeponet_hmc  import DeepONetHMC
 from StateSpaceModels.ssm_base import SSM
 from StateSpaceModels.stochastic_vol import StochasticVolatilityModel
 from FilterModules.filter_base import BaseFilter
 from FilterModules.DifferentiableFilters.soft_resample import SoftResamplingParticleFilter
+from FilterModules.NeuralFilter.deeponet_sinkhorn_ledh import DeepONetSinkhornLEDHFilter
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    print(f"GPU(s) available: {[g.name for g in gpus]}")
+else:
+    print("No GPU found — running on CPU")
 
 DTYPE = tf.float32
 tfd = tfp.distributions
@@ -30,17 +40,22 @@ def run_hmc_experiment(
     num_iterations: int = 1000,
     burn_in: int = 100,
     step_size: float = 0.01,
-    num_leapfrog_steps: int = 10
+    num_leapfrog_steps: int = 10,
+    hmc_class: type = HMC,
+    observations: tf.Tensor = None,
 ):
-    print(f"--- Generating synthetic data (T={T}) ---")
-    true_ssm = ssm_builder(true_theta)
-    true_states, observations = true_ssm.simulate(T)
-    
-    preprocess_fn = true_ssm.filter_components().get("preprocess_obs", lambda y: y)
-    processed_observations = preprocess_fn(observations)
+    if observations is not None:
+        processed_observations = observations
+        print(f"--- Using pre-generated observations (T={observations.shape[0]}) ---")
+    else:
+        print(f"--- Generating synthetic data (T={T}) ---")
+        true_ssm = ssm_builder(true_theta)
+        _, raw_obs = true_ssm.simulate(T)
+        preprocess_fn = true_ssm.filter_components().get("preprocess_obs", lambda y: y)
+        processed_observations = preprocess_fn(raw_obs)
     
     print(f"\n--- Initializing HMC with Filter: {filter_module.label} ---")
-    hmc_sampler = HMC(
+    hmc_sampler = hmc_class(
         ssm_builder=ssm_builder,
         filter_module=filter_module,
         prior_log_prob_fn=prior_log_prob_fn
@@ -129,6 +144,21 @@ def run_hmc_experiment(
 
 
 if __name__ == "__main__":
+    from experiment_deeponet_sinkhorn_schemes import sample_posterior_pilot, pretrain_with_scheme
+
+    # Memory-conscious parameters:
+    #   T=100      — halves GradientTape graph (200 → 100 unrolled filter steps)
+    #   N=50       — quartic reduction in (N,N) Sinkhorn cost/transport matrices
+    #   leapfrog=5 — halves gradient evaluations per HMC proposal
+    T              = 30
+    N_PARTICLES    = 50
+    NUM_LEAPFROG   = 5
+    PILOT_N        = 30
+    PILOT_ITERS    = 120
+    PILOT_BURN_IN  = 40
+    N_THETA_POOL   = 128
+    PRETRAIN_STEPS = 600
+
     def sv_builder(theta: tf.Tensor) -> SSM:
         return StochasticVolatilityModel(alpha=theta[0], sigma=theta[1], beta=theta[2], static_diff=True)
 
@@ -144,19 +174,56 @@ if __name__ == "__main__":
     true_theta_sv = tf.constant([0.91, 1.0, 0.5], dtype=DTYPE)
     init_theta_sv = tf.constant([0.5, 0.5, 0.5], dtype=DTYPE)
     param_labels_sv = ['alpha', 'sigma', 'beta']
-    
-    soft_res = SoftResamplingParticleFilter(num_particles=100, soft_alpha=0.5, label="SoftRes_PF_SV")
 
+    # ── 1. Generate one fixed observation sequence ─────────────────────
+    print(f"--- Generating synthetic data (T={T}) ---")
+    _true_ssm = sv_builder(true_theta_sv)
+    _, _raw_obs = _true_ssm.simulate(T)
+    _preprocess = _true_ssm.filter_components().get("preprocess_obs", lambda y: y)
+    obs_tf = tf.constant(_preprocess(_raw_obs), dtype=DTYPE)
+
+    # ── 2. Posterior-focused theta pool from short pilot HMC ───────────
+    print("\n--- Running posterior-focused pilot HMC ---")
+    theta_pool = sample_posterior_pilot(
+        n_samples=N_THETA_POOL,
+        ssm_builder=sv_builder,
+        prior_log_prob=sv_prior,
+        true_theta=true_theta_sv.numpy(),
+        observations=obs_tf,
+        pilot_N=PILOT_N,
+        pilot_iters=PILOT_ITERS,
+        pilot_burn_in=PILOT_BURN_IN,
+        step_size=0.005,
+        leapfrog=5,
+    )
+
+    # ── 3. Build filter (smaller network), pretrain ────────────────────
+    deeponet_filter = DeepONetSinkhornLEDHFilter(
+        num_particles=N_PARTICLES,
+        theta_dim=3,
+        num_basis=8,
+        embed_dim=16,
+        label="DeepONet-Sinkhorn LEDH (SV)"
+    )
+    deeponet_filter.load_ssm(sv_builder(true_theta_sv))
+    deeponet_filter.set_theta(true_theta_sv)
+
+    print(f"\n--- Pretraining with posterior-focused scheme ({PRETRAIN_STEPS} steps) ---")
+    pretrain_with_scheme(deeponet_filter, theta_pool, sv_builder, steps=PRETRAIN_STEPS)
+
+    # ── 4. Full HMC run on the same observations ───────────────────────
     run_hmc_experiment(
         ssm_builder=sv_builder,
-        filter_module=soft_res,
+        filter_module=deeponet_filter,
         prior_log_prob_fn=sv_prior,
         true_theta=true_theta_sv,
         init_theta=init_theta_sv,
         param_labels=param_labels_sv,
-        T=200,
-        num_iterations=300,
+        T=T,
+        num_iterations=200,
         burn_in=50,
         step_size=0.01,
-        num_leapfrog_steps=10
+        num_leapfrog_steps=NUM_LEAPFROG,
+        hmc_class=DeepONetHMC,
+        observations=obs_tf,
     )
